@@ -1,5 +1,8 @@
 const std = @import("std");
 
+const Directory = @import("Directory.zig");
+const introspect = @import("introspect.zig");
+
 var global_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const allocator = &global_arena.allocator;
 
@@ -27,11 +30,6 @@ pub fn main() !u8 {
     std.os.exit(0xff);
 }
 
-const Directory = struct {
-    path: []const u8,
-    handle: std.fs.Dir,
-};
-
 // NOTE: this code was copied from the zig compiler in main.zig cmdBuild
 //       maybe it should be in std?
 fn findBuildDir(cwd: []const u8) ?Directory {
@@ -41,20 +39,35 @@ fn findBuildDir(cwd: []const u8) ?Directory {
         const joined_path = std.fs.path.join(allocator, &[_][]const u8{ dirname, "build.zig" }) catch @panic("memory");
         defer allocator.free(joined_path);
         if (std.fs.cwd().access(joined_path, .{})) |_| {
-            const dir = std.fs.cwd().openDir(dirname, .{}) catch |err| {
-                std.log.err("unable to open directory while searching for build.zig file, '{s}': {s}", .{ dirname, @errorName(err) });
-                std.os.exit(0xff);
-            };
+            const dir = std.fs.cwd().openDir(dirname, .{}) catch |err|
+                fatal("unable to open directory while searching for build.zig file, '{s}': {s}", .{ dirname, @errorName(err) });
+
             return Directory{ .path = dirname, .handle = dir };
         } else |err| switch (err) {
             error.FileNotFound => {
                 dirname = std.fs.path.dirname(dirname) orelse return null;
                 continue;
             },
-            else => |e| std.debug.panic("failed to access '{s}': {s}", .{joined_path, @errorName(e)}),
+            else => |e| fatal("failed to access '{s}': {s}", .{joined_path, @errorName(e)}),
         }
     }
+}
 
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.log.err(fmt, args);
+    std.os.exit(0xff);
+}
+
+fn findLibDir(override_lib_dir: ?[]const u8) !Directory {
+    const self_exe_path = try std.fs.selfExePathAlloc(allocator);
+    return if (override_lib_dir) |lib_dir| .{
+        .path = lib_dir,
+        .handle = std.fs.cwd().openDir(lib_dir, .{}) catch |err| {
+            fatal("unable to open zig-toolchain lib directory from 'zig-lib-dir' argument or env, '{s}': {s}", .{ lib_dir, @errorName(err) });
+        },
+    } else introspect.findZigLibDirFromSelfExe(allocator, self_exe_path) catch |err| {
+        fatal("unable to find zig-toolchain lib directory from exe path '{s}': {s}\n", .{self_exe_path, @errorName(err)});
+    };
 }
 
 fn printRun(cwd: []const u8, argv: []const []const u8) void {
@@ -79,30 +92,21 @@ fn run(cwd: []const u8, argv: []const []const u8) []u8 {
     child.stderr_behavior = .Inherit;
     child.cwd = cwd;
 
-    child.spawn() catch |err| {
-        std.log.err("{s} failed with {s}", .{argv[0], @errorName(err)});
-        std.os.exit(0xff);
-    };
+    child.spawn() catch |err|
+        fatal("{s} failed with {s}", .{argv[0], @errorName(err)});
 
-    const stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024) catch |err| {
-        std.log.err("failed to read stdout from {s}: {s}", .{argv[0], @errorName(err)});
-        std.os.exit(0xff);
-    };
+    const stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024) catch |err|
+        fatal("failed to read stdout from {s}: {s}", .{argv[0], @errorName(err)});
+
     errdefer allocator.free(stdout);
 
-    const result = child.wait() catch |err| {
-        std.log.err("failed to wait for {s}: {s}", .{argv[0], @errorName(err)});
-        std.os.exit(0xff);
-    };
+    const result = child.wait() catch |err|
+        fatal("failed to wait for {s}: {s}", .{argv[0], @errorName(err)});
+
     switch (result) {
-        .Exited => |code| if (code != 0) {
-            std.log.err("{s} failed with exit code {}", .{argv[0], code});
-            std.os.exit(0xff);
-        },
-        else => {
-            std.log.err("{s} failed with: {}", .{argv[0], result});
-            std.os.exit(0xff);
-        },
+        .Exited => |code| if (code != 0)
+            fatal("{s} failed with exit code {}", .{argv[0], code}),
+        else => fatal("{s} failed with: {}", .{argv[0], result}),
     }
     return stdout;
 }
@@ -112,6 +116,9 @@ fn msvc(args: [][:0]const u8) !u8 {
         std.log.err("msvc toolchain does not take any arguments", .{});
         return 1;
     }
+
+    var lib_dir = try findLibDir(null);
+    defer lib_dir.handle.close();
 
     const cwd = try std.process.getCwdAlloc(allocator);
     var build_dir = findBuildDir(cwd) orelse Directory{ .path = cwd, .handle = std.fs.cwd() };
@@ -132,14 +139,8 @@ fn msvc(args: [][:0]const u8) !u8 {
     defer allocator.free(msvc_src_path);
     try std.fs.cwd().makePath(msvc_src_path);
     {
-        const cl_zig_path = try std.fs.path.join(allocator, &[_][]const u8 {msvc_src_path, "copy-of-cl.zig"});
+        const cl_zig_path = try std.fs.path.join(allocator, &[_][]const u8 {lib_dir.path, "cl.zig"});
         defer allocator.free(cl_zig_path);
-
-        {
-            const cl_zig = try std.fs.createFileAbsolute(cl_zig_path, .{});
-            defer cl_zig.close();
-            try cl_zig.writeAll(@embedFile("cl.zig"));
-        }
 
         var zig_args = std.ArrayList([]const u8).init(allocator);
         defer zig_args.deinit();
