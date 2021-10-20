@@ -3,8 +3,20 @@ const std = @import("std");
 var global_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 const allocator = &global_arena.allocator;
 
+const TodoIgnore = struct {
+    starts_with: []const u8,
+    description: []const u8,
+};
+const todo_ignores = [_]TodoIgnore {
+    .{ .starts_with = "-W", .description = "set warning level" },
+    .{ .starts_with = "-Z7", .description = "enable old-style debug info" },
+    .{ .starts_with = "-GS", .description = "enable security checks" },
+    .{ .starts_with = "-Gs", .description = "control stack checking calls" },
+};
+
 pub fn main() !u8 {
-    const verbose = true;
+    //const verbose = true;
+
     var args = try std.process.argsAlloc(allocator);
     // no need to free args
     if (args.len <= 1) {
@@ -20,14 +32,12 @@ pub fn main() !u8 {
     args = args[1..];
 
     var zig_args = std.ArrayList([]const u8).init(allocator);
-    // defer zig_args.deinit(); probably unnecessary
 
     try zig_args.append("zig");
     try zig_args.append("cc");
 
-
     var args_index: usize = 0;
-    while (args_index < args.len) : (args_index += 1) {
+    args_loop: while (args_index < args.len) : (args_index += 1) {
         const arg = args[args_index];
         // just a hack for now
         if (arg[0] == '/') arg[0] = '-';
@@ -43,12 +53,26 @@ pub fn main() !u8 {
                 try zig_args.append(arg);
             }
         } else if (std.mem.eql(u8, arg, "-nologo")) {
-            if (verbose) {
-                std.log.info("ignoring '{s}'", .{arg});
-            }
+            // ignore
         } else if (std.mem.startsWith(u8, arg, "-D")) {
             try zig_args.append(arg);
+        } else if (std.mem.eql(u8, arg, "-Od")) {
+            try zig_args.append("-cl-opt-disable");
+        } else if (std.mem.startsWith(u8, arg, "-Fe")) {
+            try zig_args.append("-o");
+            try zig_args.append(arg[2..]);
+        } else if (std.mem.eql(u8, arg, "-link")) {
+            const result = try parseLinkArgs(args[args_index+1..], &zig_args);
+            if (result != 0) return result;
+            break;
         } else {
+            for (todo_ignores) |todo_ignore| {
+                if (std.mem.startsWith(u8, arg, todo_ignore.starts_with)) {
+                    std.log.info("todo: not sure how to translate '{s}' ({s})", .{arg, todo_ignore.description});
+                    continue :args_loop;
+                }
+            }
+
             std.log.warn("cl(zig-toolchain): unknown cl argument '{s}'", .{arg});
             try zig_args.append(arg);
         }
@@ -77,6 +101,29 @@ pub fn main() !u8 {
             std.os.exit(0xff);
         },
     }
+}
+
+fn parseLinkArgs(args: []const []u8, zig_args: *std.ArrayList([]const u8)) !u8 {
+    var args_index: usize = 0;
+    while (args_index < args.len) : (args_index += 1) {
+        const arg = args[args_index];
+        // just a hack for now
+        if (arg[0] == '/') arg[0] = '-';
+
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            if (false) {
+            } else {
+                std.log.warn("cl(zig-toolchain): unknown non-option link argument '{s}'", .{arg});
+                try zig_args.append("-Xlinker");
+                try zig_args.append(arg);
+            }
+        } else {
+            std.log.warn("cl(zig-toolchain): unknown cl link argument '{s}'", .{arg});
+            try zig_args.append("-Xlinker");
+            try zig_args.append(arg);
+        }
+    }
+    return 0;
 }
 
 // TODO: put this somewhere common
