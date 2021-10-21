@@ -70,7 +70,7 @@ fn findLibDir(override_lib_dir: ?[]const u8) !Directory {
     };
 }
 
-fn printRun(cwd: []const u8, argv: []const []const u8) void {
+fn printRun(optional_cwd: ?[]const u8, argv: []const []const u8) void {
     var msg = std.ArrayList(u8).init(allocator);
     defer msg.deinit();
     const writer = msg.writer();
@@ -79,9 +79,35 @@ fn printRun(cwd: []const u8, argv: []const []const u8) void {
         writer.print("{s}\"{s}\"", .{prefix, arg}) catch @panic("memory");
         prefix = " ";
     }
-    std.log.info("[RUN] cd \"{s}\" && {s}", .{cwd, msg.items});
+    if (optional_cwd) |cwd| {
+        std.log.info("[RUN] cd \"{s}\" && {s}", .{cwd, msg.items});
+    } else {
+        std.log.info("[RUN] {s}", .{msg.items});
+    }
 }
-fn run(cwd: []const u8, argv: []const []const u8) []u8 {
+fn runNoCapture(error_context: []const u8, cwd: ?[]const u8, argv: []const []const u8) void {
+    const child = std.ChildProcess.init(argv, allocator) catch |err| switch (err) {
+        error.OutOfMemory => @panic("memory"),
+    };
+    defer child.deinit();
+
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.cwd = cwd;
+
+    child.spawn() catch |err|
+        fatal("{s} failed with {s}", .{error_context, @errorName(err)});
+    const result = child.wait() catch |err|
+        fatal("failed to wait for {s}: {s}", .{error_context, @errorName(err)});
+
+    switch (result) {
+        .Exited => |code| if (code != 0)
+            fatal("{s} failed with exit code {}", .{error_context, code}),
+        else => fatal("{s} crashed with: {}", .{error_context, result}),
+    }
+}
+fn run(cwd: ?[]const u8, argv: []const []const u8) []u8 {
     const child = std.ChildProcess.init(argv, allocator) catch |err| switch (err) {
         error.OutOfMemory => @panic("memory"),
     };
@@ -111,98 +137,59 @@ fn run(cwd: []const u8, argv: []const []const u8) []u8 {
     return stdout;
 }
 
-fn msvc(args: [][:0]const u8) !u8 {
-    if (args.len != 0) {
-        std.log.err("msvc toolchain does not take any arguments", .{});
-        return 1;
-    }
-
+fn buildToolchain(toolchain_name: []const u8) !void {
     var lib_dir = try findLibDir(null);
     defer lib_dir.handle.close();
 
     const cwd = try std.process.getCwdAlloc(allocator);
     var build_dir = findBuildDir(cwd) orelse Directory{ .path = cwd, .handle = std.fs.cwd() };
     defer build_dir.handle.close();
-    std.log.info("installing msvc toolchain to '{s}'", .{build_dir.path});
+    std.log.info("installing {s} toolchain to '{s}'", .{toolchain_name, build_dir.path});
 
-    try build_dir.handle.makePath("zig-cache");
+    const cache_root = try std.fs.path.join(allocator, &[_][]const u8 {build_dir.path, "zig-cache" });
+    defer allocator.free(cache_root);
 
-    const msvc_path = try std.fs.path.join(allocator, &[_][]const u8 {build_dir.path, "zig-cache", "msvc-toolchain"});
-    defer allocator.free(msvc_path);
-    try std.fs.cwd().makePath(msvc_path);
+    const toolchain_path = try std.fs.path.join(allocator, &[_][]const u8 { cache_root, "toolchain", toolchain_name});
+    defer allocator.free(toolchain_path);
+    try std.fs.cwd().makePath(toolchain_path);
 
-    const msvc_bin_path = try std.fs.path.join(allocator, &[_][]const u8 {msvc_path, "bin"});
-    defer allocator.free(msvc_bin_path);
-    try std.fs.cwd().makePath(msvc_bin_path);
-
-    const msvc_src_path = try std.fs.path.join(allocator, &[_][]const u8 {msvc_path, "src"});
-    defer allocator.free(msvc_src_path);
-    try std.fs.cwd().makePath(msvc_src_path);
     {
-        const cl_zig_path = try std.fs.path.join(allocator, &[_][]const u8 {lib_dir.path, "cl.zig"});
-        defer allocator.free(cl_zig_path);
+        const build_file = try std.fs.path.join(allocator, &[_][]const u8 {lib_dir.path, "build.zig"});
+        defer allocator.free(build_file);
 
         var zig_args = std.ArrayList([]const u8).init(allocator);
         defer zig_args.deinit();
         try zig_args.append("zig");
-        try zig_args.append("build-exe");
-        try zig_args.append("--name");
-        try zig_args.append("cl");
-        try zig_args.append("--single-threaded");
-        try zig_args.append("--enable-cache");
-
-        const cache_path = try std.fs.path.join(allocator, &[_][]const u8 {msvc_src_path, "zig-cache"});
-        defer allocator.free(cache_path);
-        try std.fs.cwd().makePath(cache_path);
+        try zig_args.append("build");
+        try zig_args.append("--prefix");
+        try zig_args.append(toolchain_path);
+        try zig_args.append("--build-file");
+        try zig_args.append(build_file);
+        try zig_args.append(toolchain_name);
         try zig_args.append("--cache-dir");
-        try zig_args.append(cache_path);
+        try zig_args.append(cache_root);
 
-        try zig_args.append(cl_zig_path);
-
-        printRun(msvc_src_path, zig_args.items);
-        const exe_cache_path_nl = run(msvc_src_path, zig_args.items);
-        defer allocator.free(exe_cache_path_nl);
-        const exe_cache_path = std.mem.trimRight(u8, exe_cache_path_nl, "\r\n");
-
-        var dest_dir = try std.fs.cwd().openDir(msvc_bin_path, .{});
-        defer dest_dir.close();
-
-        var exe_cache_dir = try std.fs.cwd().openDir(exe_cache_path, .{ .iterate = true });
-        defer exe_cache_dir.close();
-        var exe_cache_dir_it = exe_cache_dir.iterate();
-        while (try exe_cache_dir_it.next()) |entry| {
-
-            // The compiler can put these files into the same directory, but we don't
-            // want to copy them over.
-            if (   !std.mem.startsWith(u8, entry.name, "cl.")
-                or std.mem.endsWith(u8, entry.name, ".id")
-                or std.mem.endsWith(u8, entry.name, ".zig")
-                or std.mem.endsWith(u8, entry.name, ".txt")
-                or std.mem.endsWith(u8, entry.name, ".o")
-                or std.mem.endsWith(u8, entry.name, ".obj")
-            ) continue;
-            std.log.info("installing '{s}'", .{entry.name});
-            _ = try exe_cache_dir.updateFile(entry.name, dest_dir, entry.name, .{});
-        }
+        printRun(null, zig_args.items);
+        runNoCapture("zig build toolchain", null, zig_args.items);
     }
 
-
-    const zig_toolchain_env_path = try std.fs.path.join(allocator, &[_][]const u8 {msvc_bin_path, "zig-env.bat"});
-    defer allocator.free(zig_toolchain_env_path);
-    {
-        var zig_env_bat = try std.fs.cwd().createFile(zig_toolchain_env_path, .{});
-        defer zig_env_bat.close();
-        const writer = zig_env_bat.writer();
-        try writer.print("set PATH=%~dp0;%PATH%\n", .{});
-        try writer.print("set Platform=x64\n", .{});
-    }
+    const zig_env_bat = try std.fs.path.join(allocator, &[_][]const u8 { toolchain_path, "bin", "zig-env.bat" });
+    defer allocator.free(zig_env_bat);
 
     const stdout = std.io.getStdOut().writer();
     // TODO: check if this path is already in the PATH
     try stdout.print("\n", .{});
     try stdout.print("Run the following to setup the environment in a BATCH shell:\n", .{});
-    try stdout.print("{s}\n", .{zig_toolchain_env_path});
-
-    return 0;
+    try stdout.print("{s}\n", .{zig_env_bat});
 }
 
+
+fn msvc(args: [][:0]const u8) !u8 {
+    if (args.len != 0) {
+        std.log.err("msvc toolchain does not take any arguments", .{});
+        return 1;
+    }
+
+    try buildToolchain("msvc");
+    return 0;
+}
