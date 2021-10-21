@@ -78,6 +78,10 @@ pub fn main() !u8 {
         }
     }
 
+    // Add msvc specific stuff
+    // TODO: only add this for the applicable target
+    try zig_args.append("-D_M_X64");
+
     // TODO: use execve on posix platforms
     printRun(zig_args.items);
     const child = try std.ChildProcess.init(zig_args.items, allocator);
